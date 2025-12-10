@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 import builtins
 import secrets
+import ipaddress
 from flask import Flask, request, Response, jsonify, send_from_directory, abort
 from flask_cors import CORS
 from functools import wraps
@@ -555,6 +556,11 @@ class FileManager:
 file_manager = FileManager()
 
 
+def get_ssl_verify() -> bool:
+    """获取SSL验证配置"""
+    return os.getenv("SSL_VERIFY", "false").lower() == "true"
+
+
 def check_proxy(proxy: str) -> bool:
     """检测代理是否可用"""
     if not proxy:
@@ -562,7 +568,7 @@ def check_proxy(proxy: str) -> bool:
     try:
         proxies = {"http": proxy, "https": proxy}
         resp = requests.get("https://www.google.com", proxies=proxies, 
-                          verify=False, timeout=10)
+                          verify=get_ssl_verify(), timeout=10)
         return resp.status_code == 200
     except:
         return False
@@ -667,7 +673,7 @@ def get_jwt_for_account(account: dict, proxy: str) -> str:
 
     try:
         # 第一步：请求 getoxsrf（不跟随重定向）
-        resp = requests.get(url, headers=headers, proxies=proxies, verify=False, timeout=30, allow_redirects=False)
+        resp = requests.get(url, headers=headers, proxies=proxies, verify=get_ssl_verify(), timeout=30, allow_redirects=False)
     except requests.RequestException as e:
         raise AccountRequestError(f"获取JWT 请求失败: {e}") from e
 
@@ -678,7 +684,7 @@ def get_jwt_for_account(account: dict, proxy: str) -> str:
             print(f"[DEBUG] 检测到新认证流程，重定向到: {location[:100]}...")
             try:
                 # 第二步：请求 refreshcookies
-                resp2 = requests.get(location, headers=headers, proxies=proxies, verify=False, timeout=30)
+                resp2 = requests.get(location, headers=headers, proxies=proxies, verify=get_ssl_verify(), timeout=30)
                 if resp2.status_code != 200:
                     raise AccountAuthError(f"refreshcookies 请求失败: {resp2.status_code}")
                 
@@ -699,14 +705,14 @@ def get_jwt_for_account(account: dict, proxy: str) -> str:
                 print(f"[DEBUG] setocookie URL: {setocookie_url[:100]}...")
                 
                 # 第三步：请求 setocookie（不跟随重定向）
-                resp3 = requests.get(setocookie_url, headers=headers, proxies=proxies, verify=False, timeout=30, allow_redirects=False)
+                resp3 = requests.get(setocookie_url, headers=headers, proxies=proxies, verify=get_ssl_verify(), timeout=30, allow_redirects=False)
                 
                 # setocookie 可能返回302重定向回 getoxsrf，也可能直接返回结果
                 if resp3.status_code == 302:
                     final_location = resp3.headers.get("Location", "")
                     if "getoxsrf" in final_location:
                         # 最终请求 getoxsrf
-                        resp = requests.get(final_location, headers=headers, proxies=proxies, verify=False, timeout=30)
+                        resp = requests.get(final_location, headers=headers, proxies=proxies, verify=get_ssl_verify(), timeout=30)
                     else:
                         raise AccountAuthError(f"setocookie 重定向到未知地址: {final_location}")
                 elif resp3.status_code == 200:
@@ -861,7 +867,7 @@ def create_chat_session(jwt: str, team_id: str, proxy: str, account: dict = None
             headers=get_headers(jwt, account),
             json=body,
             proxies=proxies,
-            verify=False,
+            verify=get_ssl_verify(),
             timeout=30
         )
     except requests.RequestException as e:
@@ -955,7 +961,7 @@ def upload_file_to_gemini(jwt: str, session_name: str, team_id: str,
             headers=get_headers(jwt),
             json=body,
             proxies=proxies,
-            verify=False,
+            verify=get_ssl_verify(),
             timeout=60
         )
     except requests.RequestException as e:
@@ -1161,21 +1167,31 @@ def download_image_from_url(url: str, proxy: Optional[str] = None) -> tuple[byte
         if not hostname:
             raise ValueError("无效的URL")
             
-        # 检查是否是内网地址
-        import ipaddress
+        # 检查是否是本地主机名（字符串检查）
+        if hostname.lower() in ('localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]'):
+            raise ValueError("禁止访问本地地址")
+            
+        # 尝试解析为IP地址并检查
         try:
             ip = ipaddress.ip_address(hostname)
             # 禁止访问私有IP地址
             if ip.is_private or ip.is_loopback or ip.is_link_local:
                 raise ValueError("禁止访问内网地址")
         except ValueError:
-            # hostname 不是IP地址，检查是否是本地主机名
-            if hostname.lower() in ('localhost', '127.0.0.1', '0.0.0.0', '::1'):
-                raise ValueError("禁止访问本地地址")
+            # hostname 不是IP地址（可能是域名），进行DNS解析检查
+            import socket
+            try:
+                resolved_ip = socket.gethostbyname(hostname)
+                ip = ipaddress.ip_address(resolved_ip)
+                if ip.is_private or ip.is_loopback or ip.is_link_local:
+                    raise ValueError("禁止访问内网地址（DNS解析）")
+            except (socket.gaierror, ValueError):
+                # DNS解析失败或IP检查失败，继续执行（可能是外网域名）
+                pass
         
         # 限制文件大小，防止DoS
         proxies = {"http": proxy, "https": proxy} if proxy else None
-        resp = requests.get(url, proxies=proxies, verify=False, timeout=60, stream=True)
+        resp = requests.get(url, proxies=proxies, verify=get_ssl_verify(), timeout=60, stream=True)
         resp.raise_for_status()
         
         # 检查内容大小
@@ -1218,7 +1234,7 @@ def get_session_file_metadata(jwt: str, session_name: str, team_id: str, proxy: 
         headers=get_headers(jwt),
         json=body,
         proxies=proxies,
-        verify=False,
+        verify=get_ssl_verify(),
         timeout=30
     )
     
@@ -1251,7 +1267,7 @@ def download_file_with_jwt(jwt: str, session_name: str, file_id: str, proxy: Opt
         url,
         headers=get_headers(jwt),
         proxies=proxies,
-        verify=False,
+        verify=get_ssl_verify(),
         timeout=120,
         allow_redirects=True
     )
