@@ -22,14 +22,21 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 import builtins
 import secrets
+import ipaddress
 from flask import Flask, request, Response, jsonify, send_from_directory, abort
 from flask_cors import CORS
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
+from collections import defaultdict
+from threading import Lock
 
-# 禁用SSL警告
+# SSL警告配置
+# 注意：禁用SSL验证存在安全风险，建议仅在开发环境使用
 import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ssl_verify_enabled = os.getenv("SSL_VERIFY", "false").lower() == "true"
+if not ssl_verify_enabled:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    print("[安全警告] SSL证书验证已禁用。建议在生产环境中启用SSL验证（设置环境变量 SSL_VERIFY=true）")
 
 # 配置
 CONFIG_FILE = Path(__file__).parent / "business_gemini_session.json"
@@ -58,6 +65,15 @@ CURRENT_LOG_LEVEL = LOG_LEVELS[CURRENT_LOG_LEVEL_NAME]
 ADMIN_SECRET_KEY = None
 API_TOKENS = set()
 
+# 速率限制配置
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "60"))  # 每分钟请求数
+RATE_LIMIT_WINDOW = 60  # 时间窗口（秒）
+
+# 速率限制存储
+rate_limit_storage = defaultdict(list)
+rate_limit_lock = Lock()
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -65,7 +81,57 @@ except ImportError:
 
 # Flask应用
 app = Flask(__name__, static_folder='.')
-CORS(app)
+# CORS 配置：仅允许特定来源，或从环境变量读取
+allowed_origins = os.getenv("CORS_ORIGINS", "*")
+if allowed_origins == "*":
+    print("[安全警告] CORS配置为允许所有来源。建议在生产环境中限制CORS_ORIGINS。")
+CORS(app, resources={r"/*": {"origins": allowed_origins}})
+
+
+def check_rate_limit(identifier: str) -> bool:
+    """检查速率限制，返回是否允许请求"""
+    if not RATE_LIMIT_ENABLED:
+        return True
+    
+    with rate_limit_lock:
+        now = time.time()
+        # 清理过期的记录
+        rate_limit_storage[identifier] = [
+            ts for ts in rate_limit_storage[identifier]
+            if now - ts < RATE_LIMIT_WINDOW
+        ]
+        
+        # 检查是否超过限制
+        if len(rate_limit_storage[identifier]) >= RATE_LIMIT_REQUESTS:
+            return False
+        
+        # 记录本次请求
+        rate_limit_storage[identifier].append(now)
+        return True
+
+
+def rate_limit(func):
+    """速率限制装饰器"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        # 使用IP地址作为标识符
+        identifier = request.remote_addr or "unknown"
+        if not check_rate_limit(identifier):
+            return jsonify({"error": "请求过于频繁，请稍后再试"}), 429
+        return func(*args, **kwargs)
+    return wrapper
+
+
+@app.after_request
+def add_security_headers(response):
+    """添加安全响应头"""
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    # 移除可能泄露服务器信息的头
+    response.headers.pop('Server', None)
+    return response
 
 
 def _infer_log_level(text: str) -> str:
@@ -137,7 +203,14 @@ def get_admin_secret_key() -> str:
     if ADMIN_SECRET_KEY:
         return ADMIN_SECRET_KEY
     if account_manager.config is None:
-        ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "change_me_secret")
+        # 移除不安全的默认值，强制使用环境变量或自动生成
+        env_secret = os.getenv("ADMIN_SECRET_KEY")
+        if env_secret:
+            ADMIN_SECRET_KEY = env_secret
+        else:
+            # 自动生成强密钥
+            ADMIN_SECRET_KEY = secrets.token_urlsafe(32)
+            print("[安全警告] ADMIN_SECRET_KEY 未设置，已自动生成。请保存此密钥以便重启后使用。")
         return ADMIN_SECRET_KEY
     secret = account_manager.config.get("admin_secret_key") or os.getenv("ADMIN_SECRET_KEY")
     if not secret:
@@ -483,6 +556,11 @@ class FileManager:
 file_manager = FileManager()
 
 
+def get_ssl_verify() -> bool:
+    """获取SSL验证配置"""
+    return os.getenv("SSL_VERIFY", "false").lower() == "true"
+
+
 def check_proxy(proxy: str) -> bool:
     """检测代理是否可用"""
     if not proxy:
@@ -490,7 +568,7 @@ def check_proxy(proxy: str) -> bool:
     try:
         proxies = {"http": proxy, "https": proxy}
         resp = requests.get("https://www.google.com", proxies=proxies, 
-                          verify=False, timeout=10)
+                          verify=get_ssl_verify(), timeout=10)
         return resp.status_code == 200
     except:
         return False
@@ -595,7 +673,7 @@ def get_jwt_for_account(account: dict, proxy: str) -> str:
 
     try:
         # 第一步：请求 getoxsrf（不跟随重定向）
-        resp = requests.get(url, headers=headers, proxies=proxies, verify=False, timeout=30, allow_redirects=False)
+        resp = requests.get(url, headers=headers, proxies=proxies, verify=get_ssl_verify(), timeout=30, allow_redirects=False)
     except requests.RequestException as e:
         raise AccountRequestError(f"获取JWT 请求失败: {e}") from e
 
@@ -606,7 +684,7 @@ def get_jwt_for_account(account: dict, proxy: str) -> str:
             print(f"[DEBUG] 检测到新认证流程，重定向到: {location[:100]}...")
             try:
                 # 第二步：请求 refreshcookies
-                resp2 = requests.get(location, headers=headers, proxies=proxies, verify=False, timeout=30)
+                resp2 = requests.get(location, headers=headers, proxies=proxies, verify=get_ssl_verify(), timeout=30)
                 if resp2.status_code != 200:
                     raise AccountAuthError(f"refreshcookies 请求失败: {resp2.status_code}")
                 
@@ -627,14 +705,14 @@ def get_jwt_for_account(account: dict, proxy: str) -> str:
                 print(f"[DEBUG] setocookie URL: {setocookie_url[:100]}...")
                 
                 # 第三步：请求 setocookie（不跟随重定向）
-                resp3 = requests.get(setocookie_url, headers=headers, proxies=proxies, verify=False, timeout=30, allow_redirects=False)
+                resp3 = requests.get(setocookie_url, headers=headers, proxies=proxies, verify=get_ssl_verify(), timeout=30, allow_redirects=False)
                 
                 # setocookie 可能返回302重定向回 getoxsrf，也可能直接返回结果
                 if resp3.status_code == 302:
                     final_location = resp3.headers.get("Location", "")
                     if "getoxsrf" in final_location:
                         # 最终请求 getoxsrf
-                        resp = requests.get(final_location, headers=headers, proxies=proxies, verify=False, timeout=30)
+                        resp = requests.get(final_location, headers=headers, proxies=proxies, verify=get_ssl_verify(), timeout=30)
                     else:
                         raise AccountAuthError(f"setocookie 重定向到未知地址: {final_location}")
                 elif resp3.status_code == 200:
@@ -669,7 +747,10 @@ def get_jwt_for_account(account: dict, proxy: str) -> str:
     if not key_id or not xsrf_token:
         raise AccountAuthError(f"JWT 响应缺少 keyId/xsrfToken: {data}")
 
-    print(f"账号: {account.get('csesidx')} 账号可用! key_id: {key_id}")
+    # 使用脱敏的日志输出，避免信息泄露
+    csesidx = account.get('csesidx', 'unknown')
+    csesidx_masked = f"{csesidx[:4]}***{csesidx[-4:]}" if len(csesidx) > 8 else "***"
+    print(f"账号: {csesidx_masked} 账号可用! key_id: {key_id[:8]}***")
 
     key_bytes = decode_xsrf_token(xsrf_token)
 
@@ -786,7 +867,7 @@ def create_chat_session(jwt: str, team_id: str, proxy: str, account: dict = None
             headers=get_headers(jwt, account),
             json=body,
             proxies=proxies,
-            verify=False,
+            verify=get_ssl_verify(),
             timeout=30
         )
     except requests.RequestException as e:
@@ -880,7 +961,7 @@ def upload_file_to_gemini(jwt: str, session_name: str, team_id: str,
             headers=get_headers(jwt),
             json=body,
             proxies=proxies,
-            verify=False,
+            verify=get_ssl_verify(),
             timeout=60
         )
     except requests.RequestException as e:
@@ -1071,15 +1152,69 @@ def extract_images_from_openai_content(content: Any) -> tuple[str, List[Dict]]:
 
 def download_image_from_url(url: str, proxy: Optional[str] = None) -> tuple[bytes, str]:
     """从URL下载图片，返回(图片数据, mime_type)"""
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    resp = requests.get(url, proxies=proxies, verify=False, timeout=60)
-    resp.raise_for_status()
+    # 安全检查：防止SSRF攻击
+    from urllib.parse import urlparse
     
-    content_type = resp.headers.get("Content-Type", "image/png")
-    # 提取主mime类型
-    mime_type = content_type.split(";")[0].strip()
-    
-    return resp.content, mime_type
+    try:
+        parsed = urlparse(url)
+        
+        # 只允许 http 和 https 协议
+        if parsed.scheme not in ('http', 'https'):
+            raise ValueError(f"不支持的协议: {parsed.scheme}")
+        
+        # 禁止访问内网地址
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError("无效的URL")
+            
+        # 检查是否是本地主机名（字符串检查）
+        if hostname.lower() in ('localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]'):
+            raise ValueError("禁止访问本地地址")
+            
+        # 尝试解析为IP地址并检查
+        try:
+            ip = ipaddress.ip_address(hostname)
+            # 禁止访问私有IP地址
+            if ip.is_private or ip.is_loopback or ip.is_link_local:
+                raise ValueError("禁止访问内网地址")
+        except ValueError:
+            # hostname 不是IP地址（可能是域名），进行DNS解析检查
+            import socket
+            try:
+                resolved_ip = socket.gethostbyname(hostname)
+                ip = ipaddress.ip_address(resolved_ip)
+                if ip.is_private or ip.is_loopback or ip.is_link_local:
+                    raise ValueError("禁止访问内网地址（DNS解析）")
+            except (socket.gaierror, ValueError):
+                # DNS解析失败或IP检查失败，继续执行（可能是外网域名）
+                pass
+        
+        # 限制文件大小，防止DoS
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        resp = requests.get(url, proxies=proxies, verify=get_ssl_verify(), timeout=60, stream=True)
+        resp.raise_for_status()
+        
+        # 检查内容大小
+        content_length = resp.headers.get('Content-Length')
+        max_size = 10 * 1024 * 1024  # 10MB
+        if content_length and int(content_length) > max_size:
+            raise ValueError(f"文件过大: {content_length} 字节")
+        
+        # 分块读取内容，限制总大小
+        content = b''
+        for chunk in resp.iter_content(chunk_size=8192):
+            content += chunk
+            if len(content) > max_size:
+                raise ValueError("文件过大")
+        
+        content_type = resp.headers.get("Content-Type", "image/png")
+        # 提取主mime类型
+        mime_type = content_type.split(";")[0].strip()
+        
+        return content, mime_type
+    except Exception as e:
+        print(f"[安全] 下载图片失败: {e}")
+        raise
 
 
 def get_session_file_metadata(jwt: str, session_name: str, team_id: str, proxy: Optional[str] = None) -> Dict:
@@ -1099,7 +1234,7 @@ def get_session_file_metadata(jwt: str, session_name: str, team_id: str, proxy: 
         headers=get_headers(jwt),
         json=body,
         proxies=proxies,
-        verify=False,
+        verify=get_ssl_verify(),
         timeout=30
     )
     
@@ -1132,7 +1267,7 @@ def download_file_with_jwt(jwt: str, session_name: str, file_id: str, proxy: Opt
         url,
         headers=get_headers(jwt),
         proxies=proxies,
-        verify=False,
+        verify=get_ssl_verify(),
         timeout=120,
         allow_redirects=True
     )
@@ -1634,6 +1769,7 @@ def parse_attachment(att: Dict, result: ChatResponse, proxy: Optional[str] = Non
 
 @app.route('/v1/models', methods=['GET'])
 @require_api_auth
+@rate_limit
 def list_models():
     """获取模型列表"""
     models_config = account_manager.config.get("models", [])
@@ -1667,6 +1803,7 @@ def list_models():
 
 @app.route('/v1/files', methods=['POST'])
 @require_api_auth
+@rate_limit
 def upload_file():
     """OpenAI 兼容的文件上传接口"""
     import traceback
@@ -1878,6 +2015,7 @@ def delete_file(file_id):
 
 @app.route('/v1/chat/completions', methods=['POST'])
 @require_api_auth
+@rate_limit
 def chat_completions():
     """聊天对话接口（支持图片输入输出）"""
     try:
@@ -2227,7 +2365,20 @@ def build_openai_response_content(chat_response: ChatResponse, host_url: str) ->
 def serve_image(filename):
     """提供缓存图片的访问"""
     # 安全检查：防止路径遍历
-    if '..' in filename or filename.startswith('/'):
+    # 使用更严格的路径验证
+    try:
+        # 规范化路径并检查是否在允许的目录内
+        safe_path = Path(filename).resolve()
+        cache_dir = IMAGE_CACHE_DIR.resolve()
+        
+        # 检查路径是否在缓存目录内
+        if not str(safe_path).startswith(str(cache_dir)):
+            abort(404)
+            
+        # 额外检查：防止各种路径遍历技术
+        if '..' in filename or filename.startswith('/') or '\\' in filename:
+            abort(404)
+    except (ValueError, OSError):
         abort(404)
     
     filepath = IMAGE_CACHE_DIR / filename
@@ -2608,6 +2759,7 @@ def logging_config():
 
 
 @app.route('/api/auth/login', methods=['POST'])
+@rate_limit
 def admin_login():
     """后台登录，返回 token。若尚未设置密码，则首次设置。"""
     data = request.json or {}
@@ -2625,12 +2777,14 @@ def admin_login():
     
     token = create_admin_token()
     resp = jsonify({"token": token, "level": CURRENT_LOG_LEVEL_NAME})
+    # 根据环境自动设置secure标志
+    is_production = os.getenv("FLASK_ENV") == "production" or os.getenv("ENVIRONMENT") == "production"
     resp.set_cookie(
         "admin_token",
         token,
         max_age=86400,
         httponly=True,
-        secure=False,
+        secure=is_production,  # 生产环境使用HTTPS
         samesite="Lax",
         path="/"
     )
